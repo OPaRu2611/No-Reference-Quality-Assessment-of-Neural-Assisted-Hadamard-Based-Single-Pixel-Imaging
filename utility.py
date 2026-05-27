@@ -3,6 +3,8 @@ from numpy.lib.stride_tricks import as_strided
 import pandas as pd
 import matplotlib.pyplot as plt
 import cv2
+import pywt
+from scipy.fftpack import dct, idct
 import torch
 import torch.nn as nn
 from IPython.display import clear_output
@@ -11,6 +13,7 @@ from skimage.data import chelsea
 from skimage.restoration import estimate_sigma
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import normalized_root_mse as snrmse
 import subprocess
 import sys
 import os
@@ -55,32 +58,24 @@ def weighted_hadamard_from_vector(vec, k):
         6. Returns an image-like array in uint8 data-type
     """
 
-    # ==============================
-    # 1. 
-    # ==============================
+    
     vec2 = np.copy(vec)
     vec2 = np.asarray(vec, dtype=np.float64)
     n2 = vec2.size
     if n2 % 2 != 0:
-        raise ValueError("Vector size must be (2n).")
+        raise ValueError("El tamaño del vector debe ser par (2n).")
 
     n = n2 // 2
     if k <= 0 or (k & (k - 1)) != 0:
-        raise ValueError("k must be a power of 2")
+        raise ValueError("k debe ser potencia de 2 (8, 16, 32, ...).")
 
-    # ==============================
-    # 2.
-    # ==============================
+    
     vec2[1::2] *= -1
 
-    # ==============================
-    # 3. 
-    # ==============================
-    v_sum = vec2[0::2] + vec2[1::2]  # tamaño n
+    
+    v_sum = vec2[0::2] + vec2[1::2]  
 
-    # ==============================
-    # 4. 
-    # ==============================
+    
 
     def build_v_set(kpow):
         V = [np.array([1], dtype=np.int8)]
@@ -91,6 +86,56 @@ def weighted_hadamard_from_vector(vec, k):
                 newV.append(np.concatenate([v, -v]))  # [v -v]
             V = newV
         return V
+
+    def sign_changes_count(v):
+        return int(np.count_nonzero(v[:-1] != v[1:]))
+
+    def sequency_sort(V):
+        counts = [sign_changes_count(v) for v in V]
+        indices = sorted(range(len(V)), key=lambda i: (counts[i], i))
+        return [V[i] for i in indices]
+
+    def outer_product_patterns(Vordered):
+        m = len(Vordered)
+        return [[np.outer(Vordered[i], Vordered[j]) for j in range(m)] for i in range(m)]
+
+    def zigzag_indices(n):
+        idx = []
+        for s in range(2*n - 1):
+            if s % 2 == 0:
+                i_start = min(s, n-1)
+                i_end = max(0, s - (n-1))
+                for i in range(i_start, i_end - 1, -1):
+                    j = s - i
+                    idx.append((i, j))
+            else:
+                j_start = min(s, n-1)
+                j_end = max(0, s - (n-1))
+                for j in range(j_start, j_end - 1, -1):
+                    i = s - j
+                    idx.append((i, j))
+        return idx
+
+    kpow = int(math.log2(k))
+    V = build_v_set(kpow)
+    Vordered = sequency_sort(V)
+    grid = outer_product_patterns(Vordered)
+    zz = zigzag_indices(k)
+    ordered_patterns = [grid[i][j] for (i, j) in zz]
+
+    
+    m = min(n, len(ordered_patterns))  
+    M = np.zeros((k, k), dtype=np.float64)
+
+    for i in range(m):
+        M += v_sum[i] * ordered_patterns[i]
+
+    
+    M -= M.min()
+    if M.max() != 0:
+        M = 255 * M / M.max()
+
+    return M.astype(np.uint8)
 
     def sign_changes_count(v):
         return int(np.count_nonzero(v[:-1] != v[1:]))
@@ -488,11 +533,11 @@ def dip(img, device, show=True):
     pad='reflection'
     )
 
-    n_img = img.astype(float)
-    n_img *= 255./img.max()
-    n_img -= img.min()
+    #n_img = img.astype(float)
+    #n_img *= 255./img.max()
+    #n_img -= img.min()
 
-    y_tensor = torch.tensor(n_img).float().to(device)
+    y_tensor = torch.tensor(img).float().to(device)
 
     H,W = y_tensor.size()
     rnd_input = torch.rand(H,W).to(device)
@@ -784,6 +829,11 @@ def numerical_evaluation(img, noise_lvls, device, referenced=True, no_referenced
 
             track["psnr_corrupted"] = psnr(img, track["corrupted"], data_range=img.max() - img.min())
             track["psnr_denoised"] = psnr(img, track["denoised"], data_range=img.max() - img.min())
+
+            track["nrmse_corrupted"] = snrmse(img, track["corrupted"])
+            track["nrmse_denoised"] = snrmse(img, track["denoised"])
+
+            
         if no_referenced:
             residue = poisson_run["corrupted"].copy() - denoised.copy()
             track["residue"] = residue.copy()
@@ -804,3 +854,82 @@ def numerical_evaluation(img, noise_lvls, device, referenced=True, no_referenced
         results.append(track)
 
     return pd.DataFrame(results)
+def wavelet_denoise(image, wavelet='db1', level=2, method='soft'):
+    coeffs = pywt.wavedec2(image, wavelet, level=level)
+
+    # Estimate noise sigma from HH subband
+    hh = coeffs[-1][-1]
+    sigma = np.median(np.abs(hh)) / 0.6745
+
+    # Universal threshold (VisuShrink)
+    T = sigma * np.sqrt(2 * np.log(image.size))
+
+    def threshold(x):
+        if method == 'soft':
+            return np.sign(x) * np.maximum(np.abs(x) - T, 0)
+        else:  # hard
+            return x * (np.abs(x) > T)
+
+    new_coeffs = [coeffs[0]]
+    for detail_level in coeffs[1:]:
+        new_coeffs.append(tuple(threshold(c) for c in detail_level))
+
+    return pywt.waverec2(new_coeffs, wavelet)
+def bilateral_filter(image, sigma_s=3, sigma_r=1., window_size=7):
+    h, w = image.shape
+    pad = window_size // 2
+    padded = np.pad(image, pad, mode='reflect')
+    result = np.zeros_like(image, dtype=float)
+
+    # Precompute spatial Gaussian
+    x, y = np.mgrid[-pad:pad+1, -pad:pad+1]
+    spatial = np.exp(-(x**2 + y**2) / (2 * sigma_s**2))
+
+    for i in range(h):
+        for j in range(w):
+            patch = padded[i:i+window_size, j:j+window_size]
+            center = padded[i+pad, j+pad]
+
+            range_kernel = np.exp(-((patch - center)**2) / (2 * sigma_r**2))
+            weights = spatial * range_kernel
+
+            result[i, j] = np.sum(weights * patch) / np.sum(weights)
+
+    return result
+def algorithm_comparation(img, noise_lvls, device, show=True):
+  """ Runs hadamard poisson experiment and reconstruction for different lvls of noise
+      and also wavelet threshold filtering along bilateral filtering
+     ----------
+    img : ndarray (N, N), N power of 2
+        Input image
+    noise_lvls : array
+        array of values for poisson corruption
+    show: bool
+        if true will show a graphics of every_subprocess
+    """
+  results = list()
+  for noise_lvl in noise_lvls:
+      track = pd.Series(dtype=object)
+      track["noise_lvl"] = noise_lvl
+        
+      poisson_run = hadamard_poisson_experiment(img=img,lvl=noise_lvl,clip=True,show=show)
+      track["corrupted"] = poisson_run["corrupted"].copy()
+
+
+      denoised_bi = bilateral_filter(image=track["corrupted"], sigma_r=estimate_sigma(track["corrupted"], average_sigmas=True), window_size=7)
+      track["denoised_bi"] = denoised_bi.copy()
+
+      denoised_wt = wavelet_denoise(image=track["corrupted"], wavelet="haar",level=1)
+      track["denoised_wt"] = denoised_wt.copy()
+
+      track["ssim_corrupted"] = ssim(img, track["corrupted"], data_range=img.max() - img.min())
+      track["ssim_bi"] = ssim(img, track["denoised_bi"], data_range=img.max() - img.min())
+      track["ssim_wt"] = ssim(img, track["denoised_wt"], data_range=img.max() - img.min())
+
+      track["psnr_corrupted"] = psnr(img, track["corrupted"], data_range=img.max() - img.min())
+      track["psnr_bi"] = psnr(img, track["denoised_bi"], data_range=img.max() - img.min())
+      track["psnr_wt"] = psnr(img, track["denoised_wt"], data_range=img.max() - img.min())
+
+      results.append(track)
+  
+  return pd.DataFrame(results)
